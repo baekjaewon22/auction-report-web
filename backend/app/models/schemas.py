@@ -1,0 +1,60 @@
+# -*- coding: utf-8 -*-
+"""Pydantic 모델 (API 요청/응답 스키마)"""
+
+from typing import Optional
+from pydantic import BaseModel
+
+
+class ReportRequest(BaseModel):
+    """보고서 생성 요청"""
+    url: str                          # 마이옥션 상세 URL
+    myauction_id: str                 # 마이옥션 아이디
+    myauction_pw: str                 # 마이옥션 비밀번호
+    remember_login: bool = True       # 자동로그인 세션 유지
+    xlsx_path: Optional[str] = None   # 엑셀 파일 경로 (선택)
+
+
+class PropertyData(BaseModel):
+    """파싱된 부동산 데이터"""
+    court: str = ""
+    case_number: str = ""
+    address: str = ""
+    address_old: str = ""
+    land_zoning: str = ""
+    appraisal_raw: str = ""
+    item_type: str = ""
+    land_area_m2: str = ""
+    land_area_py: str = ""
+    building_area_m2: str = ""
+    building_area_py: str = ""
+    xx평형: str = ""
+    building_structure: str = ""
+    building_scale: str = ""
+    auction_date: str = ""
+    appraised_price: str = ""
+    min_price: str = ""
+    min_rate: str = ""
+    deposit: str = ""
+    claim_amount: str = ""
+    photo_url: str = ""
+    landplan_url: str = ""
+    LAND_MODE: bool = False
+    BUILDING_MODE: bool = True
+
+
+class ProgressUpdate(BaseModel):
+    """WebSocket 진행상황 메시지"""
+    step: int                # 현재 단계 (0~)
+    total_steps: int         # 전체 단계 수
+    title: str               # 단계 제목
+    message: str             # 상세 메시지
+    status: str = "running"  # running | completed | error
+    percent: float = 0.0     # 0.0 ~ 100.0
+
+
+class ReportResult(BaseModel):
+    """보고서 생성 결과"""
+    success: bool
+    output_file: Optional[str] = None
+    message: str = ""
+    data: Optional[PropertyData] = None

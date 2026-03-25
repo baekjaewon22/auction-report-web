@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.spec.bak
+
+# Node
+node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# 환경
+.env
+*.log
+venv/
+.venv/
+
+# 작업 파일
+output/
+capture/
+download_pdf/
+logs/
+selenium_profile/
+*.pptm
+!backend/templates/*.pptm
+
+# OS
+.DS_Store
+Thumbs.db
