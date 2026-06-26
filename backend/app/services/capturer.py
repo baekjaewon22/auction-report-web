@@ -23,7 +23,7 @@ from selenium.common.exceptions import TimeoutException
 
 from ..core.config import CAPTURE_DIR, ensure_dirs
 from ..core.utils import track_file, ensure_dir_for_file
-from .selenium_driver import wait_document_ready, switch_to_new_window
+from .selenium_driver import safe_click, wait_document_ready, switch_to_new_window
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ def open_court_guide_popup(driver, timeout=15):
         By.XPATH,
         "//a[contains(normalize-space(.),'관할법원안내') or contains(@onclick,'court_layer')]"
     )))
-    driver.execute_script("arguments[0].click();", btn)
+    safe_click(driver, btn)
 
     end = time.time() + timeout
     popup_handle = None
@@ -194,7 +194,18 @@ def capture_court_popup(driver, out_path: str, timeout=15):
 def capture_kakaomap(driver, out_path: str):
     ensure_dir_for_file(out_path)
     wait_document_ready(driver, timeout=30)
-    time.sleep(1.2)
+
+    # 카카오맵 좌측 패널 닫기 시도
+    try:
+        driver.execute_script("""
+            var panel = document.querySelector('#dimmedLayer, .dimmedLayer, #searchLayout');
+            if (panel) panel.style.display = 'none';
+            var aside = document.querySelector('aside, .sidebar, #sidebar');
+            if (aside) aside.style.display = 'none';
+        """)
+    except Exception:
+        pass
+    time.sleep(2)
 
     driver.execute_cdp_cmd("Page.enable", {})
     shot = driver.execute_cdp_cmd("Page.captureScreenshot", {
@@ -203,10 +214,17 @@ def capture_kakaomap(driver, out_path: str):
     full_img = Image.open(BytesIO(base64.b64decode(shot["data"]))).convert("RGB")
     w, h = full_img.size
 
-    left_cut = min(520, max(300, int(w * 0.28)))
-    cropped = full_img.crop((left_cut, 0, w, h))
+    logger.info(f"카카오맵 캡처 원본 크기: {w}x{h}")
+
+    # 좌측 패널 영역 제거 (비율 기반) - 주소 팝업 포함
+    left_cut = min(680, max(400, int(w * 0.36)))
+    # 상하단 여백 제거
+    top_cut = max(0, int(h * 0.03))
+    bottom_cut = max(0, int(h * 0.03))
+    cropped = full_img.crop((left_cut, top_cut, w, h - bottom_cut))
     cropped.save(out_path, "PNG")
     track_file(out_path)
+    logger.info(f"카카오맵 캡처 완료: {out_path} ({cropped.size[0]}x{cropped.size[1]})")
     return out_path
 
 
@@ -222,19 +240,18 @@ def open_kakao_and_capture(driver, popup_handle, link_text: str, out_path: str):
         try:
             driver.switch_to.default_content()
             el = driver.find_element(By.XPATH, xpath)
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            time.sleep(0.2)
-            driver.execute_script("arguments[0].click();", el)
+            safe_click(driver, el)
             break
         except Exception:
             time.sleep(0.3)
 
     new_handle = switch_to_new_window(driver, before_tabs, timeout=20)
+    # headless에서는 maximize가 안 먹히므로 항상 크기 강제 설정
     try:
-        driver.maximize_window()
-    except Exception:
         driver.set_window_size(1920, 1080)
-    time.sleep(1.2)
+    except Exception:
+        pass
+    time.sleep(2)
 
     try:
         capture_kakaomap(driver, out_path)
@@ -256,7 +273,7 @@ def capture_land_use_plan(driver, out_path: str, timeout=20):
     btn = wait.until(EC.element_to_be_clickable((
         By.XPATH, "//a[contains(normalize-space(.),'토지이용계획')]"
     )))
-    driver.execute_script("arguments[0].click();", btn)
+    safe_click(driver, btn)
 
     new_handle = None
     end = time.time() + timeout
@@ -426,26 +443,25 @@ def capture_building_overview(driver, out_path: str, timeout=15):
     base_handle = driver.current_window_handle
     before_handles = set(driver.window_handles)
 
-    # 1) 사이드바 링크 찾기 (CSS 셀렉터 우선, 없으면 텍스트로 탐색)
+    # 1) 사이드바 링크 찾기 (텍스트 우선, 없으면 기존 메뉴 순서로 fallback)
     link = None
-    try:
-        link = driver.find_element(By.CSS_SELECTOR, "#dtlw_link > ul > li:nth-child(5) > a")
-    except Exception:
-        pass
+    keywords = ["내부구조도", "호별배치도", "건물개황도"]
+    for kw in keywords:
+        try:
+            link = driver.find_element(
+                By.XPATH,
+                f"//div[@id='dtlw_link']//a[contains(normalize-space(.), '{kw}')]"
+            )
+            if link:
+                break
+        except Exception:
+            continue
 
     if not link:
-        # 텍스트 기반 탐색
-        keywords = ["내부구조도", "호별배치도", "건물개황도"]
-        for kw in keywords:
-            try:
-                link = driver.find_element(
-                    By.XPATH,
-                    f"//div[@id='dtlw_link']//a[contains(normalize-space(.), '{kw}')]"
-                )
-                if link:
-                    break
-            except Exception:
-                continue
+        try:
+            link = driver.find_element(By.CSS_SELECTOR, "#dtlw_link > ul > li:nth-child(5) > a")
+        except Exception:
+            pass
 
     if not link:
         raise RuntimeError("건물개황도/내부구조도/호별배치도 링크를 찾지 못했습니다.")
@@ -454,9 +470,7 @@ def capture_building_overview(driver, out_path: str, timeout=15):
     logger.info(f"건물개황도 링크 발견: '{link_text}'")
 
     # 2) 클릭 → 새 탭 열기
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", link)
-    time.sleep(0.3)
-    driver.execute_script("arguments[0].click();", link)
+    safe_click(driver, link)
 
     # 3) 새 탭 대기
     new_handle = None

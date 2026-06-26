@@ -4,6 +4,10 @@
   "version": "1.0.0",
   "description": "경매 보고서 자동화",
   "main": "electron/main.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/baekjaewon22/auction-report-web.git"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -13,6 +17,7 @@
     "electron:pack": "electron-builder --dir"
   },
   "dependencies": {
+    "electron-updater": "^6.8.3",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -45,17 +50,10 @@
     ],
     "extraResources": [
       {
-        "from": "../backend",
+        "from": "../backend/dist/backend",
         "to": "backend",
         "filter": [
-          "**/*",
-          "!__pycache__/**",
-          "!*.pyc",
-          "!logs/**",
-          "!output/**",
-          "!capture/**",
-          "!download_pdf/**",
-          "!selenium_profile/**"
+          "**/*"
         ]
       }
     ],
@@ -70,6 +68,11 @@
         "ko"
       ],
       "language": "1042"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "baekjaewon22",
+      "repo": "auction-report-web"
     }
   }
 }

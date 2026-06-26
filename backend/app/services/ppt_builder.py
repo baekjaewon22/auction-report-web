@@ -12,6 +12,7 @@ PPT 생성 서비스
 import os
 import re
 import logging
+import shutil
 import tempfile
 import zipfile
 from io import BytesIO
@@ -19,7 +20,12 @@ from copy import deepcopy
 from typing import Optional, Tuple, Dict
 
 import requests
+from PIL import Image as PILImage
 from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.oxml.ns import qn
+from pptx.oxml.xmlchemy import OxmlElement
+from pptx.util import Pt
 
 from ..core.config import settings, CAPTURE_DIR
 from ..core.utils import track_file
@@ -28,6 +34,11 @@ from .capturer import trim_white_margin
 logger = logging.getLogger(__name__)
 
 TARGET_SLIDE_INDEX = 2  # 0-base → 3번 슬라이드
+DEFAULT_PPT_FONT_NAME = "G마켓 산스 TTF Medium"
+OPINION_NAVY = RGBColor(20, 48, 92)
+OPINION_BLUE = RGBColor(0, 150, 214)
+RIGHTS_OPINION_HEADING_PT = 18
+RIGHTS_OPINION_BODY_PT = 12
 
 
 # ============================================================
@@ -79,6 +90,7 @@ def replace_first_number_preserve_runs(text_frame, new_number: str) -> bool:
     start, end = m.span(1)
     idx, replaced = 0, False
     for r in runs:
+        _force_run_font(r)
         t = r.text or ""
         rs, re_ = idx, idx + len(t)
         if re_ <= start or rs >= end:
@@ -101,16 +113,53 @@ def set_text_keep_style(text_frame, new_text: str):
     p.clear()
     r = p.add_run()
     r.text = new_text
+    _copy_font_style(font_tpl, r.font)
+    _force_run_font(r)
+
+
+def _copy_font_style(font_tpl, dst_font) -> None:
     if font_tpl:
-        r.font.name = font_tpl.name
-        r.font.size = font_tpl.size
-        r.font.bold = font_tpl.bold
-        r.font.italic = font_tpl.italic
-        r.font.underline = font_tpl.underline
+        dst_font.size = font_tpl.size
+        dst_font.bold = font_tpl.bold
+        dst_font.italic = font_tpl.italic
+        dst_font.underline = font_tpl.underline
         try:
-            r.font.color.rgb = font_tpl.color.rgb
+            dst_font.color.rgb = font_tpl.color.rgb
         except Exception:
             pass
+
+
+def _force_run_font(run, font_name: str = DEFAULT_PPT_FONT_NAME) -> None:
+    try:
+        run.font.name = font_name
+    except Exception:
+        pass
+    try:
+        r_pr = run._r.get_or_add_rPr()
+        for tag in ("a:latin", "a:ea", "a:cs"):
+            node = r_pr.find(qn(tag))
+            if node is None:
+                node = OxmlElement(tag)
+                r_pr.append(node)
+            node.set("typeface", font_name)
+    except Exception:
+        pass
+
+
+def set_multiline_text_keep_style(text_frame, new_text: str):
+    first_paragraph = text_frame.paragraphs[0] if text_frame.paragraphs else text_frame.add_paragraph()
+    font_tpl = first_paragraph.runs[0].font if first_paragraph.runs else None
+    align_tpl = first_paragraph.alignment
+
+    text_frame.clear()
+    lines = str(new_text or "").splitlines() or [""]
+    for idx, line in enumerate(lines):
+        p = text_frame.paragraphs[0] if idx == 0 else text_frame.add_paragraph()
+        p.alignment = align_tpl
+        r = p.add_run()
+        r.text = line
+        _copy_font_style(font_tpl, r.font)
+        _force_run_font(r)
 
 
 _WON_RE = re.compile(r"(\d[\d,]*)\s*원")
@@ -124,10 +173,7 @@ def remove_won_unit_in_slide(slide):
         old = "\n".join([p.text for p in tf.paragraphs])
         new = _WON_RE.sub(r"\1", old)
         if new != old:
-            tf.clear()
-            for i, line in enumerate(new.split("\n")):
-                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                p.text = line
+            set_multiline_text_keep_style(tf, new)
 
 
 # ============================================================
@@ -146,6 +192,13 @@ def find_slide_by_keyword(prs: Presentation, keyword: str):
             if hangul_re.search(rest):
                 continue
             return slide
+    for slide in prs.slides:
+        try:
+            notes = slide.notes_slide.notes_text_frame.text or ""
+        except Exception:
+            notes = ""
+        if keyword in notes:
+            return slide
     return None
 
 
@@ -157,6 +210,17 @@ def find_slide_by_note_key(prs: Presentation, key: str):
                 return s
         except Exception:
             continue
+    return None
+
+
+def find_slide_by_note_keywords(prs: Presentation, keywords: list[str]):
+    for s in prs.slides:
+        try:
+            notes = s.notes_slide.notes_text_frame.text or ""
+        except Exception:
+            continue
+        if any(keyword in notes for keyword in keywords):
+            return s
     return None
 
 
@@ -250,28 +314,59 @@ def move_slide(prs, old_index, new_index):
 # ============================================================
 def fill_slide_with_data(prs: Presentation, data: dict):
     for idx, slide in enumerate(prs.slides):
-        for shape in slide.shapes:
-            if not hasattr(shape, "text_frame"):
-                continue
-            placeholder = (shape.text or "").strip()
-            if not placeholder:
-                continue
-            key = None
-            if placeholder.startswith("{") and placeholder.endswith("}"):
-                key = placeholder[1:-1].strip()
-            elif placeholder.startswith("[") and placeholder.endswith("]"):
-                key = placeholder[1:-1].strip()
-            if not key or key not in data:
-                continue
-            if key == "address":
-                main_addr = data.get("address", "")
-                old_addr = data.get("address_old", "")
-                if idx == 0 and old_addr:
-                    shape.text = f"{main_addr}\n{old_addr}"
-                else:
-                    shape.text = main_addr
-            else:
-                shape.text = data[key]
+        values = dict(data or {})
+        main_addr = values.get("address", "") or ""
+        old_addr = values.get("address_old", "") or ""
+        if idx == 0 and old_addr:
+            values["address"] = f"{main_addr}\n{old_addr}"
+        _replace_template_tokens_in_shapes(slide.shapes, values)
+
+
+def _replace_template_tokens_in_shapes(shapes, data: dict) -> int:
+    updated = 0
+    for shape in shapes:
+        if hasattr(shape, "shapes"):
+            updated += _replace_template_tokens_in_shapes(shape.shapes, data)
+
+        if getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    updated += _replace_template_tokens_in_text_frame(cell.text_frame, data)
+
+        if getattr(shape, "has_text_frame", False):
+            updated += _replace_template_tokens_in_text_frame(shape.text_frame, data)
+    return updated
+
+
+def _replace_template_tokens_in_text_frame(text_frame, data: dict) -> int:
+    old = "\n".join([p.text for p in text_frame.paragraphs])
+    if not old or ("{" not in old and "[" not in old):
+        return 0
+
+    new = old
+    token_values = []
+    for key, value in (data or {}).items():
+        if value is None:
+            value = ""
+        value = str(value)
+        key = str(key)
+        token_values.extend([
+            (f"{{{{{key}}}}}", value),
+            (f"{{{key}}}", value),
+            ("{" + key + "}}", value),
+            ("{{" + key + "}", value),
+            (f"[{key}]", value),
+        ])
+
+    for token, value in sorted(token_values, key=lambda item: len(item[0]), reverse=True):
+        if token in new:
+            new = new.replace(token, value)
+
+    if new == old:
+        return 0
+
+    set_multiline_text_keep_style(text_frame, new)
+    return 1
 
 
 def insert_main_photo(prs: Presentation, photo_url: str):
@@ -291,6 +386,20 @@ def insert_main_photo(prs: Presentation, photo_url: str):
         logger.info("3번 슬라이드에 대표사진 삽입 완료")
     except Exception as e:
         logger.warning(f"사진 placeholder 삽입 실패: {e}")
+        for shape in list(slide.shapes):
+            if get_alt_text(shape) != "MAIN_PHOTO_BOX":
+                continue
+            left, top, width, height = shape.left, shape.top, shape.width, shape.height
+            try:
+                slide.shapes._spTree.remove(shape._element)
+            except Exception:
+                pass
+            try:
+                slide.shapes.add_picture(img_bytes, left, top, width=width, height=height)
+                logger.info("3번 슬라이드 MAIN_PHOTO_BOX에 대표사진 삽입 완료")
+            except Exception as e2:
+                logger.warning(f"MAIN_PHOTO_BOX 사진 삽입 실패: {e2}")
+            break
 
 
 def replace_placeholders_in_slide(slide, mapping: dict):
@@ -303,10 +412,347 @@ def replace_placeholders_in_slide(slide, mapping: dict):
         for k, v in mapping.items():
             new = new.replace(k, "" if v is None else str(v))
         if new != old:
-            tf.clear()
-            for i, line in enumerate(new.split("\n")):
-                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                p.text = line
+            set_multiline_text_keep_style(tf, new)
+
+
+def apply_property_status_opinion(prs: Presentation, opinion_text: str) -> bool:
+    slide = _find_property_status_opinion_slide(prs)
+    if slide is None:
+        logger.warning("담당자 종합의견 (1) 물건현황 슬라이드를 찾지 못했습니다.")
+        return False
+
+    target = _find_main_body_text_shape(slide)
+    if target is None or not getattr(target, "has_text_frame", False):
+        logger.warning("담당자 종합의견 (1) 물건현황 본문 텍스트 박스를 찾지 못했습니다.")
+        return False
+
+    target.text_frame.word_wrap = True
+    set_multiline_text_keep_style(target.text_frame, opinion_text or "")
+    return True
+
+
+def _set_rights_analysis_rich_text(
+    text_frame,
+    opinion_text: str,
+    heading_size_pt: float = 9.8,
+    body_size_pt: float = 9.3,
+) -> None:
+    text_frame.clear()
+    text_frame.word_wrap = True
+    try:
+        text_frame.margin_left = Pt(1)
+        text_frame.margin_right = Pt(1)
+        text_frame.margin_top = Pt(1)
+        text_frame.margin_bottom = Pt(1)
+    except Exception:
+        pass
+
+    first = True
+    paragraph_count = 0
+    for raw_line in str(opinion_text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line or "").strip()
+        if not line:
+            continue
+
+        paragraph = text_frame.paragraphs[0] if first else text_frame.add_paragraph()
+        first = False
+        paragraph_count += 1
+        paragraph.alignment = None
+        paragraph.level = 0
+        _disable_paragraph_numbering(paragraph)
+
+        if re.match(r"^\d+\)", line):
+            paragraph.space_before = Pt(7) if paragraph_count > 1 else Pt(0)
+            paragraph.space_after = Pt(3)
+            _add_styled_run(paragraph, line, size_pt=heading_size_pt, bold=True, color=OPINION_NAVY)
+            continue
+
+        paragraph.space_before = Pt(2)
+        paragraph.space_after = Pt(2)
+        paragraph.line_spacing = 1.08
+        _add_highlighted_opinion_line(paragraph, line, body_size_pt=body_size_pt)
+
+    if first:
+        paragraph = text_frame.paragraphs[0]
+        _disable_paragraph_numbering(paragraph)
+        _add_styled_run(paragraph, "", size_pt=body_size_pt, bold=False, color=OPINION_NAVY)
+
+
+def _add_highlighted_opinion_line(paragraph, line: str, body_size_pt: float = 9.3) -> None:
+    text = _normalize_opinion_line(line)
+    segments = _split_opinion_highlight_segments(text)
+    for segment, emphasized in segments:
+        _add_styled_run(
+            paragraph,
+            segment,
+            size_pt=body_size_pt,
+            bold=emphasized,
+            color=OPINION_BLUE if emphasized else OPINION_NAVY,
+        )
+
+
+def _disable_paragraph_numbering(paragraph) -> None:
+    try:
+        p_pr = paragraph._p.get_or_add_pPr()
+        for child in list(p_pr):
+            if child.tag in {
+                qn("a:buAutoNum"),
+                qn("a:buChar"),
+                qn("a:buBlip"),
+                qn("a:buNone"),
+            }:
+                p_pr.remove(child)
+        p_pr.append(OxmlElement("a:buNone"))
+        for attr in ("marL", "indent"):
+            if attr in p_pr.attrib:
+                del p_pr.attrib[attr]
+    except Exception:
+        pass
+
+
+def _normalize_opinion_line(line: str) -> str:
+    line = str(line or "").strip()
+    if line.startswith("-"):
+        return "- " + line.lstrip("- ").strip()
+    return line
+
+
+def _split_opinion_highlight_segments(text: str) -> list[tuple[str, bool]]:
+    highlight_phrases = (
+        "등기부 상 낙찰자가 인수해야 하는 권리는 없습니다",
+        "등기부상 낙찰자가 인수해야 하는 권리는 없습니다",
+        "낙찰자가 인수해야 하는 권리는 없습니다",
+        "낙찰자에게 인수되는 임차권리는 없습니다",
+        "인수되는 임차권리는 없습니다",
+        "인수되는 권리는 없습니다",
+        "취하 가능성은 낮습니다",
+        "취하가능성은 낮습니다",
+        "취하 가능성 존재 합니다",
+        "취하 가능성은 존재합니다",
+        "무잉여 가능성은 없습니다",
+        "무잉여가능성은 없습니다",
+        "무잉여 가능성이 존재합니다",
+    )
+    matches: list[tuple[int, int]] = []
+    for phrase in highlight_phrases:
+        start = 0
+        while True:
+            idx = text.find(phrase, start)
+            if idx < 0:
+                break
+            matches.append((idx, idx + len(phrase)))
+            start = idx + len(phrase)
+
+    if not matches:
+        return [(text, False)]
+
+    matches.sort(key=lambda span: (span[0], -(span[1] - span[0])))
+    merged: list[tuple[int, int]] = []
+    for start, end in matches:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    segments: list[tuple[str, bool]] = []
+    cursor = 0
+    for start, end in merged:
+        if cursor < start:
+            segments.append((text[cursor:start], False))
+        segments.append((text[start:end], True))
+        cursor = end
+    if cursor < len(text):
+        segments.append((text[cursor:], False))
+    return [(segment, emphasized) for segment, emphasized in segments if segment]
+
+
+def _add_styled_run(paragraph, text: str, size_pt: float, bold: bool, color: RGBColor):
+    run = paragraph.add_run()
+    run.text = text
+    run.font.size = Pt(size_pt)
+    run.font.bold = bold
+    try:
+        run.font.color.rgb = color
+    except Exception:
+        pass
+    _force_run_font(run)
+    return run
+
+
+def apply_rights_analysis_opinion(prs: Presentation, opinion_text: str) -> bool:
+    slide = _find_opinion_slide_after_toc(prs, offset=2)
+    if slide is None:
+        slide = _find_slide_by_body_keywords(prs, ("말소기준", "임차권리", "경매취하"))
+    if slide is None:
+        logger.warning("담당자 종합의견 (2) 권리분석 슬라이드를 찾지 못했습니다.")
+        return False
+
+    target = _find_main_body_text_shape(slide)
+    if target is None or not getattr(target, "has_text_frame", False):
+        logger.warning("담당자 종합의견 (2) 권리분석 본문 텍스트 박스를 찾지 못했습니다.")
+        return False
+
+    target.text_frame.word_wrap = True
+    _set_rights_analysis_rich_text(
+        target.text_frame,
+        opinion_text or "",
+        heading_size_pt=RIGHTS_OPINION_HEADING_PT,
+        body_size_pt=RIGHTS_OPINION_BODY_PT,
+    )
+    return True
+
+
+def apply_special_opinion(prs: Presentation, opinion_text: str) -> bool:
+    if not str(opinion_text or "").strip():
+        return False
+
+    slide = _find_opinion_slide_after_toc(prs, offset=3)
+    if slide is None:
+        logger.warning("담당자 종합의견 (3) 특이사항 슬라이드를 찾지 못했습니다.")
+        return False
+
+    target = _find_main_body_text_shape(slide)
+    if target is None or not getattr(target, "has_text_frame", False):
+        target = slide.shapes.add_textbox(735013, 1486429, 9534525, 5478251)
+
+    target.text_frame.word_wrap = True
+    _set_rights_analysis_rich_text(target.text_frame, opinion_text or "")
+    return True
+
+
+def _find_property_status_opinion_slide(prs: Presentation):
+    slide = _find_opinion_slide_after_toc(prs, offset=1)
+    if slide is not None:
+        return slide
+
+    slides = list(prs.slides)
+    for slide in slides:
+        try:
+            notes = slide.notes_slide.notes_text_frame.text or ""
+        except Exception:
+            notes = ""
+        if "텍스트 작성하세요" not in notes:
+            continue
+        for shape in slide.shapes:
+            text = (getattr(shape, "text", "") or "").strip()
+            if text.startswith("본건은") and "주위" in text:
+                return slide
+    return None
+
+
+def _find_opinion_slide_after_toc(prs: Presentation, offset: int):
+    slides = list(prs.slides)
+    for idx, slide in enumerate(slides):
+        try:
+            notes = slide.notes_slide.notes_text_frame.text or ""
+        except Exception:
+            notes = ""
+        if "SLIDE_KEY=OPINION_TOC" in notes or "물건현황|권리분석|특이사항" in notes:
+            target_idx = idx + offset
+            return slides[target_idx] if 0 <= target_idx < len(slides) else None
+        for shape in slide.shapes:
+            text = (getattr(shape, "text", "") or "").replace("\n", " ")
+            compact = re.sub(r"\s+", "", text)
+            if (
+                "물건현황|권리분석|특이사항" in compact
+                or all(token in compact for token in ("물건현황", "권리분석", "특이사항"))
+            ):
+                target_idx = idx + offset
+                return slides[target_idx] if 0 <= target_idx < len(slides) else None
+    return None
+
+
+def _find_slide_by_body_keywords(prs: Presentation, keywords: tuple[str, ...]):
+    for slide in prs.slides:
+        combined = "\n".join(
+            (getattr(shape, "text", "") or "")
+            for shape in slide.shapes
+            if getattr(shape, "has_text_frame", False)
+        )
+        if all(keyword in combined for keyword in keywords):
+            return slide
+    return None
+
+
+def _find_main_body_text_shape(slide):
+    candidates = []
+    for shape in slide.shapes:
+        if not getattr(shape, "has_text_frame", False):
+            continue
+        text = (shape.text or "").strip()
+        if re.fullmatch(r"\d+", text):
+            continue
+        area = int(shape.width) * int(shape.height)
+        candidates.append((area, shape))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def apply_eviction_cost_estimates(prs: Presentation, values: dict) -> int:
+    """명도 정액제/실비제 비용 슬라이드에 강제집행 계산 결과를 반영한다."""
+    attorney_fee = int(values.get("attorney_fee") or 0)
+    normal_cost = int(values.get("normal_execution_cost") or 0)
+    myungsung_cost = int(values.get("myungsung_execution_cost") or 0)
+    flat_total = int(values.get("flat_total") or myungsung_cost)
+    cost_plus_total = int(values.get("cost_plus_total") or (attorney_fee + normal_cost))
+    updated = 0
+
+    for slide in prs.slides:
+        notes = ""
+        try:
+            notes = slide.notes_slide.notes_text_frame.text or ""
+        except Exception:
+            pass
+        if not any(key in notes for key in ("EXCEL_TEXT_AUTO", "명도정액제", "변호사수임료")):
+            continue
+
+        for shape in slide.shapes:
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            alt = get_alt_text(shape)
+            current = (shape.text or "").strip()
+            if not alt and not current:
+                continue
+
+            is_left_area = shape.left < (prs.slide_width / 2)
+            new_text = ""
+
+            if "All 총괄시트!F9" in alt:
+                new_text = _format_flat_total(flat_total, current)
+            elif "EXCEL_CALC:ACTUAL_COST_EST" in alt:
+                new_text = _format_cost_plus_total(cost_plus_total, current)
+            elif "All 총괄시트!F10" in alt:
+                new_text = _format_won_with_space(attorney_fee)
+            elif "강제집행 비용계산표!D11" in alt:
+                new_text = _format_won_with_space(normal_cost)
+
+            if new_text:
+                set_text_keep_style(shape.text_frame, new_text)
+                updated += 1
+
+    return updated
+
+
+def _format_won_with_space(value: int) -> str:
+    return f"{int(value):,} 원"
+
+
+def _format_manwon_number(value: int) -> str:
+    return f"{round(int(value) / 10000):,}"
+
+
+def _format_flat_total(value: int, current: str) -> str:
+    text = f"총 {_format_manwon_number(value)}만원"
+    return f"({text})" if current.startswith("(") else text
+
+
+def _format_cost_plus_total(value: int, current: str) -> str:
+    text = f"약 {_format_manwon_number(value)}만원 + @"
+    if current.startswith("("):
+        return f"({text}‥.)"
+    return text
 
 
 # ============================================================
@@ -342,8 +788,19 @@ def insert_images_into_ppt(prs, total_pages, keyword, img_pattern,
     def _apply_title(dst):
         for shp in dst.shapes:
             if hasattr(shp, "text") and keyword in (shp.text or ""):
-                shp.text = base_title_text
+                if getattr(shp, "has_text_frame", False):
+                    set_text_keep_style(shp.text_frame, base_title_text)
+                else:
+                    shp.text = base_title_text
                 return
+        for shp in dst.shapes:
+            if get_alt_text(shp) != "SUBTITLE":
+                continue
+            if getattr(shp, "has_text_frame", False):
+                set_text_keep_style(shp.text_frame, base_title_text)
+            elif hasattr(shp, "text"):
+                shp.text = base_title_text
+            return
 
     # 템플릿 슬라이드 결정
     template_slide = base_slide
@@ -412,7 +869,10 @@ def insert_images_into_ppt(prs, total_pages, keyword, img_pattern,
             for shp in slide.shapes:
                 if hasattr(shp, "text") and keyword in (shp.text or ""):
                     base = re.sub(r"-\d+\s*$", "", shp.text).strip()
-                    shp.text = f"{base}-{page}"
+                    if getattr(shp, "has_text_frame", False):
+                        set_text_keep_style(shp.text_frame, f"{base}-{page}")
+                    else:
+                        shp.text = f"{base}-{page}"
                     break
 
 
@@ -437,6 +897,48 @@ def insert_single_image(prs, keyword_or_key, image_path, use_note_key=False):
     except Exception:
         use_path = image_path
     slide.shapes.add_picture(use_path, l, t, width=w, height=h)
+
+
+def insert_single_image_by_note_keywords(prs, keywords: list[str], image_path: str):
+    if not image_path or not os.path.exists(image_path):
+        return False
+    slide = find_slide_by_note_keywords(prs, keywords)
+    if slide is None:
+        logger.warning(f"노트 키워드 슬라이드를 찾지 못했습니다: {keywords}")
+        return False
+    yellow = find_yellow_box(slide)
+    if yellow is None:
+        logger.warning(f"노트 키워드 슬라이드에서 노란 박스를 찾지 못했습니다: {keywords}")
+        return False
+    l, t, w, h = yellow.left, yellow.top, yellow.width, yellow.height
+    slide.shapes._spTree.remove(yellow._element)
+
+    trimmed = image_path.replace(".png", "_trim.png")
+    try:
+        trim_white_margin(image_path, trimmed)
+        track_file(trimmed)
+        use_path = trimmed
+    except Exception:
+        use_path = image_path
+    try:
+        with PILImage.open(use_path) as img:
+            img_w, img_h = img.size
+        img_ratio = img_w / img_h
+        box_ratio = w / h
+        if img_ratio > box_ratio:
+            new_w = w
+            new_h = int(w / img_ratio)
+            new_l = l
+            new_t = t + int((h - new_h) / 2)
+        else:
+            new_h = h
+            new_w = int(h * img_ratio)
+            new_l = l + int((w - new_w) / 2)
+            new_t = t
+        slide.shapes.add_picture(use_path, new_l, new_t, width=new_w, height=new_h)
+    except Exception:
+        slide.shapes.add_picture(use_path, l, t, width=w, height=h)
+    return True
 
 
 def insert_two_images_location(prs, keyword, left_img, right_img=""):
@@ -473,8 +975,26 @@ def save_pptm_preserve_vba(template_pptm: str, prs: Presentation, out_pptm: str)
     tmp_pptx = tempfile.mktemp(suffix=".pptx")
     prs.save(tmp_pptx)
 
-    with zipfile.ZipFile(template_pptm, "r") as zt:
-        vba_bin = zt.read("ppt/vbaProject.bin")
+    vba_bin = None
+    try:
+        with zipfile.ZipFile(template_pptm, "r") as zt:
+            try:
+                vba_bin = zt.read("ppt/vbaProject.bin")
+            except KeyError:
+                vba_bin = None
+    except Exception:
+        vba_bin = None
+
+    if not vba_bin:
+        try:
+            shutil.move(tmp_pptx, out_pptm)
+        finally:
+            if os.path.exists(tmp_pptx):
+                try:
+                    os.remove(tmp_pptx)
+                except Exception:
+                    pass
+        return
 
     with zipfile.ZipFile(tmp_pptx, "r") as zi, \
          zipfile.ZipFile(out_pptm, "w", compression=zipfile.ZIP_DEFLATED) as zo:

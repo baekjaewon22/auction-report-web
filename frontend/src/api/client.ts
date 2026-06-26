@@ -1,11 +1,33 @@
 const API_BASE = '/api'
 
+export type OutputType = 'auction_report' | 'rights_certificate'
+
 export interface ReportRequest {
+  output_type: OutputType
   url: string
   myauction_id: string
   myauction_pw: string
   remember_login: boolean
-  xlsx_path?: string
+  author_name?: string
+  author_title?: string
+  author_phone?: string
+  requester_role?: string
+  requester_permission?: 'basic' | 'special'
+}
+
+export interface RightsCertificateBatchRequest {
+  output_type: 'rights_certificate'
+  urls: string[]
+  myauction_id: string
+  myauction_pw: string
+  remember_login: boolean
+  author_name?: string
+  author_title?: string
+  author_phone?: string
+  requester_role?: string
+  requester_permission?: 'basic' | 'special'
+  start_at?: string
+  interval_seconds?: number
 }
 
 export interface ProgressUpdate {
@@ -23,8 +45,32 @@ export interface ReportResult {
   message: string
 }
 
+export type DownloadFormat = 'pdf' | 'pptx' | 'zip'
+
+export interface DownloadHistoryItem {
+  id: string
+  task_id: string
+  output_type: OutputType
+  title: string
+  file_name: string
+  created_at: string
+  message: string
+  exists: boolean
+  formats: DownloadFormat[]
+}
+
 export async function startReport(req: ReportRequest): Promise<{ task_id: string }> {
   const res = await fetch(`${API_BASE}/report/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) throw new Error(`서버 오류: ${res.status}`)
+  return res.json()
+}
+
+export async function startRightsCertificateBatch(req: RightsCertificateBatchRequest): Promise<{ task_id: string }> {
+  const res = await fetch(`${API_BASE}/report/start-batch`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req),
@@ -39,16 +85,20 @@ export async function getProgress(taskId: string): Promise<{ updates: ProgressUp
   return res.json()
 }
 
-export function downloadReport(): string {
-  return `${API_BASE}/report/download`
+export function downloadReport(taskId?: string, format?: DownloadFormat): string {
+  const query = format ? `?format=${format}` : ''
+  return taskId ? `${API_BASE}/report/download/${taskId}${query}` : `${API_BASE}/report/download${query}`
 }
 
-export async function uploadExcel(file: File): Promise<{ path: string; filename: string }> {
-  const form = new FormData()
-  form.append('file', file)
-  const res = await fetch(`${API_BASE}/upload/excel`, { method: 'POST', body: form })
-  if (!res.ok) throw new Error('엑셀 업로드 실패')
+export async function getDownloadHistory(): Promise<{ items: DownloadHistoryItem[]; limit: number }> {
+  const res = await fetch(`${API_BASE}/report/download-history`)
+  if (!res.ok) throw new Error('다운로드 이력 조회 실패')
   return res.json()
+}
+
+export function downloadHistoryItem(historyId: string, format?: DownloadFormat): string {
+  const query = format ? `?format=${format}` : ''
+  return `${API_BASE}/report/download-history/${historyId}${query}`
 }
 
 export function connectWebSocket(
@@ -57,7 +107,7 @@ export function connectWebSocket(
   onClose?: () => void,
 ): WebSocket {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const ws = new WebSocket(`${protocol}//${window.location.host}/ws/progress/${taskId}`)
+  const ws = new WebSocket(`${protocol}//${window.location.host}${API_BASE}/ws/progress/${taskId}`)
 
   ws.onmessage = (e) => {
     try {

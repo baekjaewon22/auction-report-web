@@ -11,7 +11,7 @@ import json
 import platform
 from pathlib import Path
 from typing import Optional
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 # ============================================================
@@ -37,12 +37,20 @@ APP_ROOT = get_app_root()
 # 디렉토리 경로
 # ============================================================
 TEMPLATES_DIR = APP_ROOT / "templates"
+RIGHTS_CERTIFICATE_TEMPLATE_DIR = TEMPLATES_DIR / "rights_certificate"
+RIGHTS_CERTIFICATE_TEMPLATE_PATH = RIGHTS_CERTIFICATE_TEMPLATE_DIR / "certificate.html"
+RIGHTS_CERTIFICATE_PPTX_TEMPLATE_PATH = RIGHTS_CERTIFICATE_TEMPLATE_DIR / "certificate.pptx"
 BIN_DIR = APP_ROOT / "bin"
 OUTPUT_DIR = APP_ROOT / "output"
 CAPTURE_DIR = APP_ROOT / "capture"
 PDF_DOWNLOAD_DIR = APP_ROOT / "download_pdf"
 LOGS_DIR = APP_ROOT / "logs"
-FRONTEND_DIST_DIR = APP_ROOT.parent / "frontend" / "dist"
+# 프론트엔드 빌드 파일 (여러 경로 시도)
+_frontend_candidates = [
+    APP_ROOT.parent / "frontend" / "dist",     # 개발 모드
+    APP_ROOT / "frontend_dist",                 # 빌드 번들 (backend 안에 복사)
+]
+FRONTEND_DIST_DIR = next((p for p in _frontend_candidates if p.exists()), _frontend_candidates[0])
 
 # Poppler (PDF → 이미지)
 POPPLER_BIN_DIR = BIN_DIR / "poppler" / "Library" / "bin"
@@ -84,7 +92,7 @@ SELENIUM_PROFILE_DIR = str(APP_ROOT / "selenium_profile")
 
 
 def ensure_dirs() -> None:
-    for d in [OUTPUT_DIR, CAPTURE_DIR, PDF_DOWNLOAD_DIR, LOGS_DIR]:
+    for d in [OUTPUT_DIR, CAPTURE_DIR, PDF_DOWNLOAD_DIR, LOGS_DIR, RIGHTS_CERTIFICATE_TEMPLATE_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -136,6 +144,13 @@ def save_config(cfg: dict) -> None:
 # FastAPI Settings
 # ============================================================
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_prefix="AUCTION_REPORT_",
+        extra="ignore",
+    )
+
     app_title: str = "경매 보고서 자동화"
     debug: bool = False
     host: str = "127.0.0.1"
@@ -143,12 +158,11 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
     # 템플릿
-    pptm_template: str = str(TEMPLATES_DIR / "샘플.pptm")
-    output_file: str = str(OUTPUT_DIR / "샘플_적용본.pptm")
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    pptm_template: str = str(TEMPLATES_DIR / "sample2_configured.pptx")
+    output_file: str = str(OUTPUT_DIR / "브리핑자료_적용본.pptx")
+    rights_certificate_template: str = str(RIGHTS_CERTIFICATE_TEMPLATE_PATH)
+    rights_certificate_pptx_template: str = str(RIGHTS_CERTIFICATE_PPTX_TEMPLATE_PATH)
+    rights_certificate_output_file: str = str(OUTPUT_DIR / "권리분석_보증서.pdf")
 
 
 settings = Settings()

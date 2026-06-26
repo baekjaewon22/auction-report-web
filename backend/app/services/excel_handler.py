@@ -336,12 +336,29 @@ def apply_excel_tokens_to_ppt(prs, xlsx_path: str) -> str:
 # 엑셀 시트 → 이미지 캡처 → PPT 노란박스 교체
 # ============================================================
 
-# 시트명 → PPT 슬라이드 인덱스(0-base) 매핑
-EXCEL_SHEET_TO_SLIDE = {
-    "(1) 예상 입찰가 금액분석표": 31,  # slide 32 (0-base: 31)
-    "(2) 취득시 비용계산표": 32,       # slide 33 (0-base: 32)
-    "(3) 강제집행 비용계산표": 36,     # slide 37 (0-base: 36)
+# 시트명 → 슬라이드 노트 키워드 매핑 (동적 탐색)
+# 이미지 삽입으로 슬라이드가 밀리므로 고정 인덱스 대신 노트 키워드로 찾음
+EXCEL_SHEET_TO_NOTE_KEYWORD = {
+    "(1) 예상 입찰가 금액분석표": ["엑셀에서 드래그 복사"],  # 첫 번째 매칭
+    "(2) 취득시 비용계산표": ["엑셀에서 드래그 복사"],       # 두 번째 매칭
 }
+
+
+def _find_slide_by_note_keyword(prs, keywords: list, skip_count: int = 0) -> int:
+    """노트에 키워드가 포함된 슬라이드를 찾는다. skip_count개를 건너뛴 후 매칭."""
+    matched = 0
+    for idx, slide in enumerate(prs.slides):
+        try:
+            note_text = slide.notes_slide.notes_text_frame.text or ""
+        except Exception:
+            continue
+        for kw in keywords:
+            if kw in note_text:
+                if matched == skip_count:
+                    return idx
+                matched += 1
+                break
+    return -1
 
 
 def capture_excel_sheets_to_images(xlsx_path: str, output_dir: str) -> dict:
@@ -400,26 +417,32 @@ def capture_excel_sheets_to_images(xlsx_path: str, output_dir: str) -> dict:
 
 
 def insert_excel_sheets_into_ppt(prs, sheet_images: dict):
-    """캡처된 엑셀 시트 이미지를 PPT 해당 슬라이드의 노란박스에 삽입"""
+    """캡처된 엑셀 시트 이미지를 PPT 해당 슬라이드의 노란박스에 삽입 (노트 키워드로 동적 탐색)"""
     from .ppt_builder import find_yellow_box
     from .capturer import trim_white_margin
 
     for sheet_name, img_path in sheet_images.items():
-        slide_idx = EXCEL_SHEET_TO_SLIDE.get(sheet_name)
-        if slide_idx is None:
+        note_keywords = EXCEL_SHEET_TO_NOTE_KEYWORD.get(sheet_name)
+        if note_keywords is None:
             continue
         if not img_path or not os.path.exists(img_path):
             continue
 
-        try:
-            if slide_idx >= len(prs.slides):
-                logger.warning(f"슬라이드 {slide_idx+1}이 없습니다 (총 {len(prs.slides)}장)")
-                continue
+        # 노트 키워드로 슬라이드 찾기
+        skip = 0
+        if sheet_name == "(2) 취득시 비용계산표":
+            skip = 1  # "엑셀에서 드래그 복사" 두 번째 매칭
+        slide_idx = _find_slide_by_note_keyword(prs, note_keywords, skip_count=skip)
 
+        if slide_idx < 0:
+            logger.warning(f"'{sheet_name}' 슬라이드를 노트 키워드로 찾지 못함")
+            continue
+
+        try:
             slide = prs.slides[slide_idx]
             yellow = find_yellow_box(slide)
             if yellow is None:
-                logger.warning(f"slide {slide_idx+1}: 노란 박스를 찾지 못했습니다.")
+                logger.warning(f"slide {slide_idx+1}: 노란 박스를 찾지 못했습니다 (시트: {sheet_name})")
                 continue
 
             left, top, width, height = yellow.left, yellow.top, yellow.width, yellow.height

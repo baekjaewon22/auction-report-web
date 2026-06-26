@@ -1,17 +1,41 @@
 # -*- coding: utf-8 -*-
 """Pydantic 모델 (API 요청/응답 스키마)"""
 
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import BaseModel
+
+
+OutputType = Literal["auction_report", "rights_certificate"]
 
 
 class ReportRequest(BaseModel):
     """보고서 생성 요청"""
+    output_type: OutputType = "auction_report"  # 결과물 종류
     url: str                          # 마이옥션 상세 URL
     myauction_id: str                 # 마이옥션 아이디
     myauction_pw: str                 # 마이옥션 비밀번호
     remember_login: bool = True       # 자동로그인 세션 유지
-    xlsx_path: Optional[str] = None   # 엑셀 파일 경로 (선택)
+    author_name: str = ""             # 가입자 성명
+    author_title: str = ""            # 가입자 직책
+    author_phone: str = ""            # 가입자 전화번호
+    requester_role: str = "user"
+    requester_permission: str = "basic"
+
+
+class RightsCertificateBatchRequest(BaseModel):
+    """권리분석 보증서 다건 생성 요청"""
+    output_type: Literal["rights_certificate"] = "rights_certificate"
+    urls: list[str]
+    myauction_id: str
+    myauction_pw: str
+    remember_login: bool = True
+    author_name: str = ""
+    author_title: str = ""
+    author_phone: str = ""
+    requester_role: str = "user"
+    requester_permission: str = "basic"
+    start_at: Optional[str] = None
+    interval_seconds: int = 5
 
 
 class PropertyData(BaseModel):

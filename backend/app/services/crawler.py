@@ -57,6 +57,61 @@ def find_appraisal_block(soup: BeautifulSoup):
     return None
 
 
+def extract_appraisal_status_text(soup: BeautifulSoup) -> str:
+    h3 = soup.find("h3", string=lambda s: s and "감정평가현황" in s)
+    if not h3:
+        return ""
+
+    title_node = h3.find_parent() or h3
+    node = title_node.find_next_sibling()
+    parts: list[str] = []
+
+    for _ in range(8):
+        if node is None:
+            break
+        if getattr(node, "name", None):
+            next_h3 = node.find("h3")
+            if next_h3 and "감정평가현황" not in next_h3.get_text(" ", strip=True):
+                break
+        text = _appraisal_node_text(node)
+        if text:
+            parts.append(text)
+        node = node.find_next_sibling()
+
+    if parts:
+        return "\n".join(parts)
+
+    block = find_appraisal_block(soup)
+    return block.get_text("\n", strip=True) if block else ""
+
+
+def _appraisal_node_text(node) -> str:
+    table = node.find("table") if hasattr(node, "find") else None
+    target = table or node
+    rows = []
+    if hasattr(target, "find_all"):
+        for tr in target.find_all("tr"):
+            cells = [
+                cell.get_text(" ", strip=True)
+                for cell in tr.find_all(["th", "td"], recursive=False)
+            ]
+            cells = [re.sub(r"\s+", " ", c).strip() for c in cells if c and c.strip()]
+            if len(cells) >= 2:
+                label, value = cells[0], " ".join(cells[1:])
+                if label in {"구분", "내용", "비고"} and value in {"구분", "내용", "비고"}:
+                    continue
+                rows.append(f"{label} {value}")
+            elif len(cells) == 1 and cells[0] not in {"구분", "내용", "비고"}:
+                rows.append(cells[0])
+    if rows:
+        return "\n".join(dict.fromkeys(rows))
+
+    text = target.get_text("\n", strip=True) if hasattr(target, "get_text") else ""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line and line not in {"구분", "내용", "비고"}]
+    return "\n".join(dict.fromkeys(lines))
+
+
 # ============================================================
 # 건축물현황 테이블
 # ============================================================
@@ -381,6 +436,7 @@ def parse_myauction_detail(soup: BeautifulSoup, base_url: str, driver=None) -> d
         "auction_date": "", "appraised_price": "", "min_price": "",
         "min_rate": "", "deposit": "", "claim_amount": "",
         "photo_url": "", "landplan_url": "",
+        "property_overview": "", "물건개요": "", "입찰기일": "",
     }
 
     # 법원/사건번호
@@ -462,35 +518,34 @@ def parse_myauction_detail(soup: BeautifulSoup, base_url: str, driver=None) -> d
                     if m:
                         data["min_rate"] = m.group(1) + "%"
 
+    _fill_basic_info_fallbacks(soup, data)
+
     # 입찰/매각기일
-    auction_date = ""
-    plan_day_p = soup.find("p", class_="plan_day")
-    if plan_day_p:
-        span = plan_day_p.find_next("span", class_="pink")
-        if span:
-            auction_date = span.get_text(strip=True)
-    if not auction_date:
-        th = soup.find(["th", "td"], string=lambda s: s and ("매각기일" in s or "입찰기일" in s))
-        if th:
-            td = th.find_next("td")
-            if td:
-                m = re.search(r"\d{4}-\d{2}-\d{2}", td.get_text(" ", strip=True))
-                if m:
-                    auction_date = m.group(0)
-    data["auction_date"] = auction_date
+    data["auction_date"] = _extract_auction_date(soup, basic_table)
+    data["입찰기일"] = data["auction_date"]
 
     # 감정평가현황
+    appraisal_text = extract_appraisal_status_text(soup)
     jraw_td = soup.find("td", id="jraw")
+    jraw_text = ""
     if jraw_td:
-        data["appraisal_raw"] = jraw_td.get_text(" ", strip=True)
+        jraw_text = jraw_td.get_text(" ", strip=True)
 
-    appraisal_block = find_appraisal_block(soup)
-    appraisal_text = appraisal_block.get_text(" ", strip=True) if appraisal_block else ""
+    if appraisal_text:
+        data["appraisal_raw"] = appraisal_text
+        if jraw_text and jraw_text not in appraisal_text:
+            data["appraisal_raw"] = f"{appraisal_text}\n{jraw_text}"
+    elif jraw_text:
+        data["appraisal_raw"] = jraw_text
+
     final_structure, scale = parse_structure_scale_roof(soup, appraisal_text)
     if final_structure:
         data["building_structure"] = final_structure
     if scale:
         data["building_scale"] = scale
+
+    data["property_overview"] = build_property_overview(data)
+    data["물건개요"] = data["property_overview"]
 
     # 토지이용계획 URL
     a_landplan = soup.find("a", string=lambda s: s and "토지이용계획" in s)
@@ -508,3 +563,184 @@ def parse_myauction_detail(soup: BeautifulSoup, base_url: str, driver=None) -> d
 
     logger.info(f"MODE: {'토지' if land_mode else '건축물'} | {data.get('item_type')}")
     return data
+
+
+def _extract_auction_date(soup: BeautifulSoup, basic_table=None) -> str:
+    selectors = [
+        "p.plan_day span.pink",
+        ".plan_day .pink",
+        ".plan_day",
+        "#dtl_table",
+    ]
+    for selector in selectors:
+        for el in soup.select(selector):
+            text = _clean_inline_text(el.get_text(" ", strip=True))
+            if not text:
+                continue
+            if selector == "#dtl_table" and not _has_auction_date_label(text):
+                continue
+            date_text = _extract_labeled_auction_date_text(text)
+            if date_text:
+                return date_text
+
+    search_roots = [basic_table] if basic_table else []
+    search_roots.append(soup)
+    for root in search_roots:
+        if root is None:
+            continue
+        label_cell = root.find(["th", "td", "li", "span", "p"], string=lambda s: s and _has_auction_date_label(s))
+        if label_cell:
+            row = label_cell.find_parent("tr")
+            candidates = []
+            if row:
+                candidates.append(row.get_text(" ", strip=True))
+                cells = row.find_all(["th", "td"], recursive=False)
+                for idx, cell in enumerate(cells):
+                    if cell is label_cell or _has_auction_date_label(cell.get_text(" ", strip=True)):
+                        candidates.extend(c.get_text(" ", strip=True) for c in cells[idx + 1:])
+            candidates.append(label_cell.find_next("td").get_text(" ", strip=True) if label_cell.find_next("td") else "")
+            candidates.append(label_cell.parent.get_text(" ", strip=True) if label_cell.parent else "")
+            for candidate in candidates:
+                date_text = _extract_labeled_auction_date_text(candidate)
+                if date_text:
+                    return date_text
+
+    for text in _candidate_texts_for_auction_date(soup):
+        date_text = _extract_labeled_auction_date_text(text)
+        if date_text:
+            return date_text
+    return ""
+
+
+def _candidate_texts_for_auction_date(soup: BeautifulSoup) -> list[str]:
+    candidates = []
+    for table in soup.find_all("table"):
+        text = _clean_inline_text(table.get_text(" ", strip=True))
+        if _has_auction_date_label(text):
+            candidates.append(text)
+    for el in soup.find_all(["li", "p", "div", "span"]):
+        text = _clean_inline_text(el.get_text(" ", strip=True))
+        if text and _has_auction_date_label(text) and len(text) <= 500:
+            candidates.append(text)
+    return candidates
+
+
+def _has_auction_date_label(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return any(label in compact for label in ("입찰기일", "매각기일", "입찰일시", "매각일시", "기일"))
+
+
+def _extract_labeled_auction_date_text(text: str) -> str:
+    text = _clean_inline_text(text)
+    if not text:
+        return ""
+    if _has_auction_date_label(text):
+        text = re.sub(r"^.*?(?:입찰기일|매각기일|입찰일시|매각일시|기일)\s*[:：]?\s*", "", text)
+    patterns = [
+        r"\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}(?:\s*\([^)]*\))?(?:\s*\d{1,2}:\d{2})?",
+        r"\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일(?:\s*\([^)]*\))?(?:\s*\d{1,2}:\d{2})?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return _clean_inline_text(match.group(0))
+    return ""
+
+
+def _clean_inline_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").replace("\xa0", " ")).strip(" /,|")
+
+
+def build_property_overview(data: dict) -> str:
+    rows: list[str] = []
+    overview_values = [
+        ("물건종류", data.get("item_type")),
+        ("소재지", data.get("address")),
+        ("토지면적", _format_area_overview(data.get("land_area_m2"), data.get("land_area_py"))),
+        ("건물면적", _format_area_overview(data.get("building_area_m2"), data.get("building_area_py"))),
+        ("감정가", data.get("appraised_price")),
+        ("최저가", data.get("min_price")),
+        ("입찰기일", data.get("auction_date")),
+    ]
+    for label, raw_value in overview_values:
+        value = _clean_inline_text(raw_value or "")
+        if value:
+            rows.append(f"{label}: {value}")
+    return "\n".join(rows)
+
+
+def _format_area_overview(area_m2: str, area_py: str) -> str:
+    m2 = _clean_inline_text(area_m2 or "")
+    py = _clean_inline_text(area_py or "")
+    if m2 and "㎡" not in m2:
+        m2 = f"{m2}㎡"
+    if py and "평" not in py:
+        py = f"{py}평"
+    return " / ".join(part for part in (m2, py) if part)
+
+
+def _fill_basic_info_fallbacks(soup: BeautifulSoup, data: dict) -> None:
+    if not data.get("item_type"):
+        data["item_type"] = _find_labeled_value(soup, ("물건종류", "용도", "종별"))
+    if not data.get("appraised_price"):
+        amount = extract_number_before_won(_find_labeled_value(soup, ("감정가", "감정평가액")))
+        data["appraised_price"] = f"{amount}원" if amount else ""
+    if not data.get("min_price"):
+        amount = extract_number_before_won(_find_labeled_value(soup, ("최저가", "최저매각가", "최저입찰가")))
+        data["min_price"] = f"{amount}원" if amount else ""
+    if not data.get("deposit"):
+        amount = extract_number_before_won(_find_labeled_value(soup, ("입찰보증금", "보증금")))
+        data["deposit"] = f"{amount}원" if amount else ""
+    if not data.get("claim_amount"):
+        amount = extract_number_before_won(_find_labeled_value(soup, ("청구금액", "청구액")))
+        data["claim_amount"] = f"{amount}원" if amount else ""
+    if not data.get("land_area_m2"):
+        m2, py = extract_area_pair(_find_labeled_value(soup, ("토지면적", "대지권면적", "대지면적")))
+        data["land_area_m2"] = m2
+        data["land_area_py"] = py
+    if not data.get("building_area_m2"):
+        value = _find_labeled_value(soup, ("건물면적", "전용면적", "전유면적"))
+        m2, py = extract_area_pair(value)
+        data["building_area_m2"] = m2
+        data["building_area_py"] = py
+        if not data.get("xx평형"):
+            m_type = re.search(r"\[?\s*([0-9.,]+평형)\s*\]?", value)
+            data["xx평형"] = f"[{m_type.group(1)}]" if m_type else ""
+
+
+def _find_labeled_value(soup: BeautifulSoup, labels: tuple[str, ...]) -> str:
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = row.find_all(["th", "td"], recursive=False)
+            if not cells:
+                continue
+            for idx, cell in enumerate(cells):
+                label_text = _clean_inline_text(cell.get_text(" ", strip=True))
+                if not any(label in label_text for label in labels):
+                    continue
+                for value_cell in cells[idx + 1:]:
+                    value = _clean_inline_text(value_cell.get_text(" ", strip=True))
+                    if value and not any(label in value for label in labels):
+                        return value
+                value = re.sub("|".join(map(re.escape, labels)), " ", label_text)
+                value = _clean_inline_text(value.strip(" :：-"))
+                if value:
+                    return value
+    for label in labels:
+        node = soup.find(string=lambda s, target=label: s and target in s)
+        if not node:
+            continue
+        parent = getattr(node, "parent", None)
+        if not parent:
+            continue
+        row = parent.find_parent("tr")
+        if row:
+            text = _clean_inline_text(row.get_text(" ", strip=True))
+            text = re.sub(rf"^.*?{re.escape(label)}\s*[:：]?\s*", "", text)
+            if text and label not in text:
+                return text
+        text = _clean_inline_text(parent.get_text(" ", strip=True))
+        text = re.sub(rf"^.*?{re.escape(label)}\s*[:：]?\s*", "", text)
+        if text and label not in text:
+            return text
+    return ""

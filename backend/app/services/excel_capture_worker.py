@@ -34,7 +34,6 @@ def capture_sheets(xlsx_path: str, output_dir: str) -> dict:
     target_sheets = [
         "(1) 예상 입찰가 금액분석표",
         "(2) 취득시 비용계산표",
-        "(3) 강제집행 비용계산표",
     ]
 
     try:

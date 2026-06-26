@@ -29,6 +29,14 @@ selenium_profile/
 *.pptm
 !backend/templates/*.pptm
 
+# 빌드 산출물
+dist_electron/
+backend/dist/
+backend/build/
+
+# 배포 도구 로컬 캐시
+auth-worker/.wrangler/
+
 # OS
 .DS_Store
 Thumbs.db

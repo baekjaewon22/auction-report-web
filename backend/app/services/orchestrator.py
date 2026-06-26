@@ -17,7 +17,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from ..core.config import (
-    settings, CAPTURE_DIR, SELENIUM_PROFILE_DIR,
+    settings, CAPTURE_DIR, OUTPUT_DIR, SELENIUM_PROFILE_DIR,
     ensure_dirs, load_config, save_config,
 )
 from ..core.utils import track_file, cleanup_generated_files
@@ -27,10 +27,12 @@ from . import crawler
 from . import capturer
 from . import pdf_processor
 from . import ppt_builder
-from . import excel_handler
+from . import forced_execution_estimator
+from . import briefing_opinion
+from . import briefing_rights
 from .selenium_driver import (
     create_driver, login_myauction, click_tab_safe,
-    switch_to_new_window, wait_document_ready,
+    switch_to_new_window, wait_document_ready, safe_click,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,9 +57,42 @@ BUILDING_OVERVIEW_PNG = str(CAPTURE_DIR / "building_overview.png")
 TOTAL_STEPS = 6
 
 
+def _safe_filename_part(value: str) -> str:
+    text = re.sub(r"\s+", "", str(value or "")).strip()
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", text)
+    text = text.strip(" ._-")
+    return text[:80]
+
+
+def _briefing_output_file(data: dict, task_id: Optional[str] = None) -> str:
+    case_number = _safe_filename_part(data.get("case_number") or "")
+    if not case_number:
+        case_number = _safe_filename_part(task_id or "") or time.strftime("%Y%m%d_%H%M%S")
+
+    output_dir = os.path.dirname(settings.output_file) or str(OUTPUT_DIR)
+    output_ext = os.path.splitext(settings.output_file)[1] or ".pptm"
+    return os.path.join(output_dir, f"브리핑자료_{case_number}{output_ext}")
+
+
+def _apply_author_fields(data: dict, request: ReportRequest) -> None:
+    author_name = str(getattr(request, "author_name", "") or "").strip()
+    author_title = str(getattr(request, "author_title", "") or "").strip()
+    author_phone = str(getattr(request, "author_phone", "") or "").strip()
+    author_name_title = " ".join(part for part in (author_name, author_title) if part).strip()
+
+    data["authorName"] = author_name
+    data["authorTitle"] = author_title
+    data["authorPhone"] = author_phone
+    data["가입자 성명"] = author_name
+    data["가입자 직책"] = author_title
+    data["가입자 성명 직책"] = author_name_title
+    data["가입자 전화번호"] = author_phone
+
+
 async def generate_report(
     request: ReportRequest,
     progress_callback: Optional[Callable] = None,
+    task_id: Optional[str] = None,
 ) -> dict:
     """
     전체 보고서 생성 파이프라인
@@ -93,6 +128,8 @@ async def generate_report(
     url = request.url.strip()
     if url.startswith("//"):
         url = "https:" + url
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
 
     # /view/ → /view3/ 변환 + 마이옥션 아이디 파라미터 추가
     import re as _re
@@ -133,7 +170,7 @@ async def generate_report(
         profile_dir = os.path.join(SELENIUM_PROFILE_DIR, safe_id)
         os.makedirs(profile_dir, exist_ok=True)
 
-    driver = create_driver(profile_dir=profile_dir)
+    driver = create_driver(profile_dir=profile_dir, headless=True)
 
     try:
         # ===== STEP 1: 로그인 + 파싱 =====
@@ -148,6 +185,7 @@ async def generate_report(
         emit(1, "사이트 파싱", "데이터 추출 중...", percent=15)
         soup = crawler.fetch_soup_from_driver(driver)
         data = crawler.parse_myauction_detail(soup, url, driver=driver)
+        _apply_author_fields(data, request)
         LAND_MODE = bool(data.get("LAND_MODE", False))
 
         # 토지이용계획 텍스트
@@ -160,12 +198,58 @@ async def generate_report(
         except Exception as e:
             logger.warning(f"토지이용계획 추출 실패: {e}")
 
+        rights_analysis_opinion = ""
+        special_opinion = ""
+        try:
+            emit(1, "사이트 파싱", "권리분석 정보 확인 중...", percent=18)
+            rights_context = briefing_rights.extract_context(soup, driver=driver, task_id=task_id)
+            if rights_context:
+                data.update(rights_context)
+            briefing_rights_data = briefing_rights.build_opinion_data(data)
+            rights_analysis_opinion = briefing_opinion.build_rights_analysis_opinion(briefing_rights_data)
+            special_opinion = briefing_opinion.build_special_opinion(briefing_rights_data)
+            data["rights_analysis_opinion"] = rights_analysis_opinion
+            data["special_opinion"] = special_opinion
+        except Exception as e:
+            logger.warning(f"담당자 종합의견 (2) 권리분석 문안 구성 실패: {e}")
+
+        try:
+            data["property_status_opinion"] = briefing_opinion.build_property_status_opinion(data)
+        except Exception as e:
+            logger.warning(f"담당자 종합의견 (1) 물건현황 문안 구성 실패: {e}")
+
+        try:
+            eviction_values = forced_execution_estimator.build_eviction_cost_values(data)
+            for key, value in eviction_values.items():
+                if key != "cost":
+                    data[key] = value
+        except Exception as e:
+            logger.warning(f"명도비 템플릿 변수 구성 실패: {e}")
+
         emit(1, "사이트 파싱", "파싱 완료", percent=20)
 
         # ===== STEP 2: PPT 기본 채우기 =====
         emit(2, "PPT 기본값", "템플릿 로드 중...", percent=20)
         prs = Presentation(settings.pptm_template)
         ppt_builder.fill_slide_with_data(prs, data)
+        try:
+            property_status_opinion = data.get("property_status_opinion") or briefing_opinion.build_property_status_opinion(data)
+            data["property_status_opinion"] = property_status_opinion
+            if ppt_builder.apply_property_status_opinion(prs, property_status_opinion):
+                logger.info("담당자 종합의견 (1) 물건현황 자동 작성 완료")
+        except Exception as e:
+            logger.warning(f"담당자 종합의견 (1) 물건현황 작성 실패: {e}")
+        try:
+            if ppt_builder.apply_rights_analysis_opinion(prs, rights_analysis_opinion):
+                logger.info("담당자 종합의견 (2) 권리분석 자동 작성 완료")
+        except Exception as e:
+            logger.warning(f"담당자 종합의견 (2) 권리분석 작성 실패: {e}")
+        try:
+            special_opinion = data.get("special_opinion") or special_opinion
+            if ppt_builder.apply_special_opinion(prs, special_opinion):
+                logger.info("담당자 종합의견 (3) 특이사항 자동 작성 완료")
+        except Exception as e:
+            logger.warning(f"담당자 종합의견 (3) 특이사항 작성 실패: {e}")
         ppt_builder.insert_main_photo(prs, data.get("photo_url", ""))
         emit(2, "PPT 기본값", "기본값 채우기 완료", percent=25)
 
@@ -206,8 +290,22 @@ async def generate_report(
         emit(3, "문서 캡처", "공시자료 팝업 열기...", percent=40)
         wait = WebDriverWait(driver, 15)
         before = set(driver.window_handles)
-        bu_link = wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "부동산표시")))
-        bu_link.click()
+        bu_link = None
+        last_popup_error = None
+        for by, value in [
+            (By.LINK_TEXT, "부동산표시"),
+            (By.PARTIAL_LINK_TEXT, "부동산표시"),
+            (By.XPATH, "//a[contains(normalize-space(.), '부동산') and contains(normalize-space(.), '표시')]"),
+            (By.XPATH, "//a[contains(normalize-space(.), '공시자료')]"),
+        ]:
+            try:
+                bu_link = wait.until(EC.element_to_be_clickable((by, value)))
+                break
+            except Exception as e:
+                last_popup_error = e
+        if not bu_link:
+            raise last_popup_error if last_popup_error else RuntimeError("공시자료 팝업 링크를 찾지 못했습니다.")
+        safe_click(driver, bu_link)
         time.sleep(1)
 
         after = set(driver.window_handles)
@@ -466,41 +564,44 @@ async def generate_report(
     if loc_left_img or loc_right_img:
         ppt_builder.insert_two_images_location(prs, "위치도", loc_left_img, loc_right_img)
 
+    # 강제집행 예상표: 파싱된 건물면적 기준으로 계산기 결과 PNG 생성 후 노란박스 삽입
+    try:
+        forced_execution_png = str(CAPTURE_DIR / "forced_execution_estimate.png")
+        forced_execution_estimator.generate_forced_execution_estimate_png(data, forced_execution_png)
+        inserted = ppt_builder.insert_single_image_by_note_keywords(
+            prs,
+            ["강제집행 예상비용표", "강제집행비용계산표"],
+            forced_execution_png,
+        )
+        if inserted:
+            logger.info("강제집행 예상표 PNG 삽입 완료")
+        else:
+            logger.warning("강제집행 예상표 PNG 삽입 대상 슬라이드를 찾지 못했습니다.")
+    except Exception as e:
+        logger.warning(f"강제집행 예상표 PNG 생성/삽입 실패: {e}")
+
     emit(4, "PPT 이미지 삽입", "삽입 완료", percent=85)
 
-    # ===== STEP 5: 엑셀 토큰 =====
-    if request.xlsx_path and os.path.exists(request.xlsx_path):
-        # (A) 엑셀 시트 → 이미지 캡처 → PPT 노란박스 교체
-        emit(5, "엑셀 반영", "엑셀 시트 캡처 중...", percent=85)
-        try:
-            cap_dir = str(CAPTURE_DIR)
-            sheet_images = excel_handler.capture_excel_sheets_to_images(request.xlsx_path, cap_dir)
-            if sheet_images:
-                excel_handler.insert_excel_sheets_into_ppt(prs, sheet_images)
-                logger.info(f"엑셀 시트 {len(sheet_images)}개 PPT 삽입 완료")
-            else:
-                logger.warning("엑셀 시트 캡처 결과 없음")
-        except Exception as e:
-            logger.warning(f"엑셀 시트 캡처/삽입 실패: {e}")
+    # 명도 정액제/실비제 비용: 엑셀 토큰 적용 후에도 파싱 면적 기반 산식이 최종값이 되도록 저장 직전 반영
+    try:
+        eviction_values = forced_execution_estimator.build_eviction_cost_values(data)
+        updated = ppt_builder.apply_eviction_cost_estimates(prs, eviction_values)
+        if updated:
+            logger.info(f"명도 정액제/실비제 비용 반영 완료: {updated}개 텍스트")
+        else:
+            logger.warning("명도 정액제/실비제 비용 반영 대상 텍스트를 찾지 못했습니다.")
+    except Exception as e:
+        logger.warning(f"명도 정액제/실비제 비용 반영 실패: {e}")
 
-        # (B) 기존 엑셀 토큰 (EXCEL_CELL, EXCEL_CALC 등)
-        emit(5, "엑셀 반영", "엑셀 토큰 적용 중...", percent=88)
-        try:
-            excel_handler.apply_excel_tokens_to_ppt(prs, request.xlsx_path)
-        except Exception as e:
-            logger.warning(f"엑셀 토큰 반영 실패: {e}")
-
-        emit(5, "엑셀 반영", "엑셀 반영 완료", percent=90)
-
-    # ===== STEP 6: 저장 =====
-    emit(6, "저장", "PPT 저장 중...", percent=90)
-    output_file = settings.output_file
+    # ===== STEP 5: 저장 =====
+    emit(5, "저장", "PPT 저장 중...", percent=90)
+    output_file = _briefing_output_file(data, task_id)
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     ppt_builder.save_pptm_preserve_vba(settings.pptm_template, prs, output_file)
 
     cleanup_generated_files()
 
-    emit(6, "저장", "완료!", status="completed", percent=100)
+    emit(5, "저장", "완료!", status="completed", percent=100)
     logger.info(f"보고서 생성 완료: {output_file}")
 
     return {

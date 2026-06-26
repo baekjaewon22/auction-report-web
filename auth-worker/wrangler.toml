@@ -1,0 +1,10 @@
+name = "auction-auth"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+[[kv_namespaces]]
+binding = "USERS"
+id = "645fd2aaf6ff40998b3e06777337e589"
+
+[vars]
+ADMIN_ID = "admin"

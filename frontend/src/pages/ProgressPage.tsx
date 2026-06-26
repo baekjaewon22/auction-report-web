@@ -1,27 +1,39 @@
 import { useEffect, useState } from 'react'
-import { getProgress, type ProgressUpdate } from '../api/client'
+import { getProgress, type OutputType, type ProgressUpdate } from '../api/client'
 
-const STEP_LABELS = [
+const AUCTION_REPORT_STEPS = [
   '브라우저 준비',
   '사이트 파싱',
   'PPT 기본값 채우기',
   '문서 캡처',
   'PPT 이미지 삽입',
-  '엑셀 반영',
+  '저장 완료',
+]
+
+const RIGHTS_CERTIFICATE_STEPS = [
+  '브라우저 준비',
+  '물건정보 확인',
+  '매각물건명세서 확인',
+  '권리분석 문구 구성',
+  '보증서 템플릿 입력',
+  'PDF/PPTX 변환',
   '저장 완료',
 ]
 
 interface Props {
   taskId: string
+  outputType: OutputType
   onComplete: (success: boolean, message: string) => void
 }
 
-export default function ProgressPage({ taskId, onComplete }: Props) {
+export default function ProgressPage({ taskId, outputType, onComplete }: Props) {
   const [updates, setUpdates] = useState<ProgressUpdate[]>([])
   const [currentStep, setCurrentStep] = useState(0)
+  const [currentTitle, setCurrentTitle] = useState('브라우저 준비')
   const [percent, setPercent] = useState(0)
   const [currentMessage, setCurrentMessage] = useState('준비 중...')
   const [status, setStatus] = useState<'running' | 'completed' | 'error'>('running')
+  const stepLabels = outputType === 'rights_certificate' ? RIGHTS_CERTIFICATE_STEPS : AUCTION_REPORT_STEPS
 
   useEffect(() => {
     let cancelled = false
@@ -43,6 +55,7 @@ export default function ProgressPage({ taskId, onComplete }: Props) {
 
         const last = data.updates[data.updates.length - 1]
         setCurrentStep(last.step)
+        setCurrentTitle(last.title)
         setPercent(last.percent)
         setCurrentMessage(last.message)
         setStatus(last.status)
@@ -66,7 +79,9 @@ export default function ProgressPage({ taskId, onComplete }: Props) {
       {/* 진행 카드 */}
       <div className="card">
         <div className="flex items-center justify-between mb-6">
-          <h2 className="text-lg font-bold text-gray-900">보고서 생성 중</h2>
+          <h2 className="text-lg font-bold text-gray-900">
+            {outputType === 'rights_certificate' ? '권리분석 보증서 생성 중' : '보고서 생성 중'}
+          </h2>
           <span className="text-2xl font-bold text-primary-600">{Math.round(percent)}%</span>
         </div>
 
@@ -103,7 +118,7 @@ export default function ProgressPage({ taskId, onComplete }: Props) {
             </svg>
           )}
           <div>
-            <p className="font-medium text-gray-800">{STEP_LABELS[currentStep] || '처리 중'}</p>
+            <p className="font-medium text-gray-800">{currentTitle || stepLabels[currentStep] || '처리 중'}</p>
             <p className="text-sm text-gray-500">{currentMessage}</p>
           </div>
         </div>
@@ -113,7 +128,7 @@ export default function ProgressPage({ taskId, onComplete }: Props) {
       <div className="card">
         <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4">진행 단계</h3>
         <div className="space-y-3">
-          {STEP_LABELS.map((label, i) => {
+          {stepLabels.map((label, i) => {
             const isDone = i < currentStep || (i === currentStep && status === 'completed')
             const isCurrent = i === currentStep && status === 'running'
             const isFuture = i > currentStep

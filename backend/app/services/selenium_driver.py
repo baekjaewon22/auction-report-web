@@ -20,6 +20,9 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
+    StaleElementReferenceException,
     TimeoutException,
     SessionNotCreatedException,
     WebDriverException,
@@ -60,7 +63,23 @@ def _build_chrome_options(profile_dir: str = "", headless: bool = False):
     return options
 
 
-def create_driver(profile_dir: str = "", headless: bool = False) -> webdriver.Chrome:
+def _short_webdriver_error(exc: Exception) -> str:
+    text = str(exc or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:500]
+
+
+def _chrome_start_error(exc: Exception) -> str:
+    message = _short_webdriver_error(exc)
+    lowered = message.lower()
+    if "user data directory is already in use" in lowered or "already in use" in lowered:
+        return "Chrome 브라우저 실행 실패: 저장 로그인 프로필이 이미 사용 중입니다. 잠시 후 다시 시도하거나 실행 중인 자동화 Chrome을 종료해 주세요."
+    if "only supports chrome version" in lowered or ("session not created" in lowered and "chrome version" in lowered):
+        return f"Chrome 브라우저 실행 실패: 크롬 버전과 ChromeDriver 환경이 맞지 않습니다. ({message})"
+    return f"Chrome 브라우저 실행 실패: {message or '원인을 확인하지 못했습니다.'}"
+
+
+def _create_driver_legacy(profile_dir: str = "", headless: bool = False) -> webdriver.Chrome:
     try:
         options = _build_chrome_options(profile_dir=profile_dir, headless=headless)
         driver = webdriver.Chrome(service=ChromeService(), options=options)
@@ -89,6 +108,38 @@ def create_driver(profile_dir: str = "", headless: bool = False) -> webdriver.Ch
     return driver
 
 
+def create_driver(profile_dir: str = "", headless: bool = False) -> webdriver.Chrome:
+    first_error = None
+    attempts = [profile_dir or ""]
+
+    if profile_dir:
+        temp_profile = os.path.join(
+            tempfile.gettempdir(),
+            f"myauction_chrome_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        attempts.append(temp_profile)
+
+    for idx, candidate_profile in enumerate(attempts):
+        try:
+            if idx > 0:
+                logger.warning(
+                    f"저장 Chrome 프로필 실행 실패, 임시 프로필로 재시도: {_short_webdriver_error(first_error)}"
+                )
+            options = _build_chrome_options(profile_dir=candidate_profile, headless=headless)
+            driver = webdriver.Chrome(service=ChromeService(), options=options)
+            driver.set_page_load_timeout(60)
+            driver.set_script_timeout(60)
+            driver.implicitly_wait(1)
+            return driver
+        except (SessionNotCreatedException, WebDriverException) as e:
+            if first_error is None:
+                first_error = e
+            if idx == len(attempts) - 1:
+                raise RuntimeError(_chrome_start_error(e)) from e
+
+    raise RuntimeError(_chrome_start_error(first_error))
+
+
 def _dismiss_alert(driver) -> str:
     """alert가 있으면 텍스트를 반환하고 닫음. 없으면 빈 문자열."""
     try:
@@ -99,6 +150,87 @@ def _dismiss_alert(driver) -> str:
         return text
     except Exception:
         return ""
+
+
+def _dismiss_click_interceptors(driver) -> None:
+    _dismiss_alert(driver)
+    try:
+        driver.execute_script("""
+            const selectors = [
+              '.ui-dialog-titlebar-close',
+              '.btn_close',
+              '.popup_close',
+              '.layer_close',
+              '.close',
+              '[aria-label="Close"]',
+              '[aria-label="닫기"]',
+              '[title="닫기"]',
+              'button[onclick*="close"]',
+              'a[onclick*="close"]'
+            ];
+            for (const selector of selectors) {
+              for (const el of document.querySelectorAll(selector)) {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                if (
+                  style.display !== 'none' &&
+                  style.visibility !== 'hidden' &&
+                  rect.width > 0 &&
+                  rect.height > 0
+                ) {
+                  el.click();
+                  return true;
+                }
+              }
+            }
+            const event = new KeyboardEvent('keydown', {
+              key: 'Escape',
+              code: 'Escape',
+              keyCode: 27,
+              which: 27,
+              bubbles: true
+            });
+            document.dispatchEvent(event);
+            window.dispatchEvent(event);
+            return false;
+        """)
+    except Exception:
+        pass
+
+
+def safe_click(driver, element, *, settle: float = 0.2) -> bool:
+    last_err = None
+    for attempt in range(2):
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                element,
+            )
+            time.sleep(settle)
+        except Exception as e:
+            last_err = e
+
+        try:
+            element.click()
+            return True
+        except (ElementClickInterceptedException, ElementNotInteractableException, StaleElementReferenceException) as e:
+            last_err = e
+            logger.warning(f"Selenium click retry ({attempt + 1}/2): {e}")
+            _dismiss_click_interceptors(driver)
+            time.sleep(0.25)
+        except Exception as e:
+            last_err = e
+            break
+
+    try:
+        driver.execute_script("arguments[0].click();", element)
+        return True
+    except Exception as e:
+        last_err = e
+
+    if last_err:
+        raise last_err
+    return False
 
 
 def login_myauction(driver: webdriver.Chrome, user_id: str, user_pw: str):
@@ -143,7 +275,7 @@ def login_myauction(driver: webdriver.Chrome, user_id: str, user_pw: str):
             # Enter 대신 로그인 버튼 클릭 시도
             try:
                 login_btn = driver.find_element(By.CSS_SELECTOR, "input[type='submit'], button[type='submit'], .btn_login, #login_btn")
-                driver.execute_script("arguments[0].click();", login_btn)
+                safe_click(driver, login_btn)
             except Exception:
                 # 버튼 못 찾으면 Enter
                 pw_box.send_keys(Keys.RETURN)
@@ -191,7 +323,7 @@ def click_tab_safe(wait: WebDriverWait, driver: webdriver.Chrome, candidates: li
     for text in candidates:
         try:
             el = wait.until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT, text)))
-            driver.execute_script("arguments[0].click();", el)
+            safe_click(driver, el)
             return text
         except Exception as e:
             last_err = e
